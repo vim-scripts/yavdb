@@ -1,0 +1,236 @@
+#!/usr/bin/env python
+#
+
+from __future__ import with_statement
+from optparse   import OptionParser
+
+import commands
+import os
+import popen2
+import re
+import string
+import sys
+import thread
+import time
+
+class VimJavaDebugger(object):
+    dbType     = 'Unknown'
+    servername = "VimDebugger"
+    quit       = False
+    lock       = thread.allocate_lock()
+    lastFile   = ''
+
+    def parseLineGDB(self, pipe, line):
+        m1 = re.search('Breakpoint 1 at 0x[0-9A-Fa-f]+: file ([A-Za-z0-9_]+\.[A-Za-z0-9_]+), line ([0-9]+).', line)
+        m2 = None
+        m3 = re.search(' at ([A-Za-z0-9_]+\.[A-Za-z0-9_]+):([0-9]+)$', line)
+        m5 = re.search('^\(gdb\) ([0-9]+)[ 	]', line)
+
+        if m1:
+            print 'Breakpoint Set Detected:', m1.groups()
+            curLine       = m1.group(2)
+            filename      = m1.group(1)
+            self.toVim('VDBBreakSet(%s, \\"%s\\", %s)' % (
+                    curLine,
+                    filename,
+                    curLine))
+        elif m3:
+            print 'File/Function Change Detected:', m3.groups()
+            curLine       = m3.group(2)
+            filename      = m3.group(1)
+            self.lastFile = filename
+            self.toVim('VDBHighlightLine(%s, \\"%s\\")' % (
+                    curLine,
+                    filename))
+        elif m5:
+            print 'Line Step Detected:', m5.groups()
+            curLine  = m5.group(1)
+            filename = self.lastFile
+            self.toVim('VDBHighlightLine(%s, \\"%s\\")' % (
+                    curLine,
+                    filename))
+        else:
+            pass
+            #print 'VDBVIM LINE READ:', line
+    #end def parseLineGDB
+
+    def parseLineJDB(self, pipe, line):
+        m1 = re.search('Set deferred breakpoint ([A-Za-z0-9]+):([0-9]+)', line)
+        m2 = re.search('Set breakpoint ([A-Za-z0-9]+):([0-9]+)$', line)
+        m4 = re.search('Removed: breakpoint ([A-Za-z0-9]+):([0-9]+)$', line)
+        m3 = re.match('Breakpoint hit: "thread=([A-Za-z0-9]+)", ([A-Za-z0-9]+).([A-Za-z0-9<>]+\([^)]*\)), line=([0-9]+) bci=([0-9]+)', line)
+        m5 = re.search('Step completed: "thread=([A-Za-z0-9]+)", ([A-Za-z0-9]+).([A-Za-z0-9<>]+\([^)]*\)), line=([0-9]+) bci=([0-9]+)', line)
+
+        if m1:
+            print 'Breakpoint Set Detected:', m1.groups()
+            curLine  = m1.group(2)
+            filename = m1.group(1) + ".java"
+            self.toVim('VDBBreakSet(%s, \\"%s\\", %s)' % (
+                    curLine,
+                    filename,
+                    curLine))
+        elif m2:
+            print 'Breakpoint Set Detected:', m2.groups()
+            curLine  = m2.group(2)
+            filename = m2.group(1) + ".java"
+            self.toVim('VDBBreakSet(%s, \\"%s\\", %s)' % (
+                    curLine,
+                    filename,
+                    curLine))
+        elif m4:
+            print 'Breakpoint Clear Detected:', m4.groups()
+            curLine  = m4.group(2)
+            filename = m4.group(1) + ".java"
+            self.toVim('VDBBreakClear(%s, \\"%s\\")' % (
+                    curLine,
+                    filename))
+        elif m3:
+            curLine  = m3.group(4)
+            filename = m3.group(2) + ".java"
+            self.toVim('VDBHighlightLine(%s, \\"%s\\")' % (
+                    curLine,
+                    filename))
+            print 'Breakpoint Stop Detected:', m3.groups()
+        elif m5:
+            curLine  = m5.group(4)
+            filename = m5.group(2) + ".java"
+            self.toVim('VDBHighlightLine(%s, \\"%s\\")' % (
+                    curLine,
+                    filename))
+            print 'Line Step Detected:', m5.groups()
+    #end def parseLineJDB
+
+    def createCmdPipe(self):
+        os.mkfifo('.%s' % self.servername, 0600)
+    #end def createCmdPipe
+
+    def removeCmdPipe(self):
+        os.system ("rm -f .%s" % self.servername)
+    #end def removeCmdPipe
+
+    def monitor(self, pipe):
+        while True:
+            cmdPipe = os.popen('cat .%s' % self.servername)
+            for line in cmdPipe.readline():
+                sys.stdout.write(line)
+                pipe.tochild.write(line)
+            #end while
+            cmdPipe.close()
+            with self.lock:
+                if self.quit:
+                    break
+            #end with
+        #end while
+    #end def monitor
+
+    def receiver(self, pipe):
+        line = ''
+        while True:
+            char = pipe.fromchild.read(1)
+
+            sys.stdout.write(char)
+            sys.stdout.flush()
+
+            if char == '\n':
+                self.parseLine(pipe, line)
+                line = ''
+            else:
+                line += char
+            #end if
+
+            with self.lock:
+                if self.quit: break
+            #end with
+        #end while
+    #end def receiver
+
+    def sender(self, pipe):
+        while True:
+            char = sys.stdin.read(1)
+            pipe.tochild.write(char)
+            with self.lock:
+                if self.quit:
+                    pipe.tochild.write('quit\n')
+                    break
+                #end if
+            #end with
+        #end while
+    #end def sender
+
+    def toVim(self, cmd, silent=True):
+        silent = "silent" if silent else ""
+        os.system('vim --servername %s -u NONE -U NONE --remote-send \"<C-\\\\><C-N>:%s call %s<CR>"' % (
+                self.servername, silent, cmd));
+    #end def toVim
+
+    def SetType(self, dbType):
+        self.dbType = dbType
+    #end def SetType
+
+    def SetServerName(self, name = "VimDebugger"):
+        self.servername = name
+    #end def SetServerName
+
+    def main(self):
+        try:
+            self.servername = self.servername.upper()
+            self.createCmdPipe()
+
+            if   self.dbType == 'Unknown': self.dbType = self.args[0]
+            if   self.dbType == 'jdb': self.parseLine = self.parseLineJDB
+            elif self.dbType == 'gdb': self.parseLine = self.parseLineGDB
+
+            servers = commands.getoutput("vim -u NONE -U NONE --serverlist")
+            servers = servers.split("\n")
+
+            if not self.servername in servers:
+                os.system("gvim --servername %s" % self.servername)
+                time.sleep(0.5)
+            #end if
+
+            cmd = ""
+            for arg in self.args:
+                cmd += " %s" % arg
+            #end for arg
+
+            self.toVim('VDBInit(\\".%s\\", \\"%s\\", \\"%s\\")' % (
+                    self.servername,
+                    os.path.realpath(os.curdir),
+                    self.dbType))
+
+            pipe = popen2.Popen3(cmd, capturestderr=False, bufsize=0)
+
+            thread.start_new_thread(self.receiver, (pipe,))
+            thread.start_new_thread(self.sender,   (pipe,))
+            thread.start_new_thread(self.monitor,  (pipe,))
+            try:
+                while True:
+                    if pipe.poll() != -1:
+                        self.quit = True
+                        break
+                    time.sleep(0.1)
+                #end while
+            except KeyboardInterrupt, ex:
+                with self.lock:
+                    self.quit = True
+            #end try...except
+            time.sleep(0.3)
+            self.toVim("VDBClose()")
+        finally:
+            self.removeCmdPipe()
+        #end try
+    #end def main
+#end class VimJavaDebugger
+
+if __name__ == "__main__":
+    obj = VimJavaDebugger()
+    parser = OptionParser()
+    parser.add_option("-s", "--server", help="GVIM Server Name", dest="servername", default="VimDebugger")
+    parser.add_option("-t", "--type",   help="Debugger Type",    dest="dbType",     default="Unknown")
+    (options,args) = parser.parse_args(sys.argv[1:], obj)
+    obj.args = args
+    obj.main()
+#end if
+
+# vim:set et ts=4 sw=4:
+#EOF
